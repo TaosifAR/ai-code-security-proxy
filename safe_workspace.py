@@ -26,7 +26,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from security_proxy import scan_and_sanitize
+from security_proxy import issue_policy_metadata, scan_and_sanitize
 
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
@@ -57,6 +57,8 @@ def is_blocked(filename: str) -> bool:
 class WorkspaceReport:
     copied: int = 0
     sanitized: dict[str, dict[str, int]] = field(default_factory=dict)  # file -> {type: n}
+    logged: dict[str, dict[str, int]] = field(default_factory=dict)
+    severities: dict[str, dict[str, str]] = field(default_factory=dict)
     blocked: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
 
@@ -106,7 +108,18 @@ def build_safe_workspace(src: str | Path, dest: str | Path, dry_run: bool = Fals
 
             safe_text, counts = scan_and_sanitize(text)
             if counts:
-                report.sanitized[rel] = dict(counts)
+                actions, severities = issue_policy_metadata(counts)
+                redactions = {
+                    kind: count for kind, count in counts.items() if actions[kind] == "redact"
+                }
+                logged = {
+                    kind: count for kind, count in counts.items() if actions[kind] == "log"
+                }
+                if redactions:
+                    report.sanitized[rel] = redactions
+                if logged:
+                    report.logged[rel] = logged
+                report.severities[rel] = severities
             report.copied += 1
             if not dry_run:
                 out = dest_p / rel
@@ -128,8 +141,24 @@ def _render_report(report: WorkspaceReport) -> str:
         "## Withheld files (not copied)",
     ]
     lines += [f"- `{p}`" for p in report.blocked] or ["- none"]
-    lines += ["", "## Files with redactions (secret types only, never values)"]
-    lines += [f"- `{p}`: {c}" for p, c in report.sanitized.items()] or ["- none"]
+    lines += ["", "## Files with redactions (secret types and severity only, never values)"]
+    lines += [
+        f"- `{path}`: "
+        + ", ".join(
+            f"{kind}={count} ({report.severities[path][kind]})"
+            for kind, count in counts.items()
+        )
+        for path, counts in report.sanitized.items()
+    ] or ["- none"]
+    lines += ["", "## Files with log-only findings (not redacted)"]
+    lines += [
+        f"- `{path}`: "
+        + ", ".join(
+            f"{kind}={count} ({report.severities[path][kind]})"
+            for kind, count in counts.items()
+        )
+        for path, counts in report.logged.items()
+    ] or ["- none"]
     lines += ["", "## Skipped files"]
     lines += [f"- {p}" for p in report.skipped] or ["- none"]
     return "\n".join(lines) + "\n"
@@ -191,13 +220,18 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    print(f"Files copied: {rep.copied} | withheld: {len(rep.blocked)} | secrets redacted: {rep.total_redactions}")
+    print(
+        f"Files copied: {rep.copied} | withheld: {len(rep.blocked)} | "
+        f"secrets redacted: {rep.total_redactions} | files with log-only findings: {len(rep.logged)}"
+    )
     for p in rep.blocked:
         print(f"  [withheld] {p}")
     for p, c in rep.sanitized.items():
         print(f"  [redacted] {p}: {c}")
+    for p, c in rep.logged.items():
+        print(f"  [logged, not redacted] {p}: {c}")
     # Non-zero exit makes --dry-run usable as a pre-commit / CI check.
-    return 1 if args.dry_run and (rep.blocked or rep.sanitized) else 0
+    return 1 if args.dry_run and (rep.blocked or rep.sanitized or rep.logged) else 0
 
 
 if __name__ == "__main__":

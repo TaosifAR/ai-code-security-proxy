@@ -15,7 +15,12 @@ from nlip_sdk.nlip import (
 )
 from nlip_server.server import NLIP_Session, SafeApplication, setup_server
 
-from security_proxy import SecretVault, safe_chat, scan_and_sanitize
+from security_proxy import (
+    SecretVault,
+    issue_policy_metadata,
+    safe_chat,
+    scan_and_sanitize,
+)
 
 logger = logging.getLogger("nlip_gateway")
 
@@ -45,10 +50,29 @@ def _extract_text_and_withheld(message: NLIP_Message) -> tuple[str, int]:
     return "\n".join(text_parts), withheld_parts
 
 
-def _security_report(counts: Counter[str], withheld_parts: int) -> str:
-    secret_counts = ", ".join(f"{kind}={count}" for kind, count in counts.items()) or "none"
+def _security_report(
+    counts: Counter[str],
+    withheld_parts: int,
+    actions: dict[str, str],
+    severities: dict[str, str],
+    egress_counts: Counter[str] | None = None,
+    egress_actions: dict[str, str] | None = None,
+    egress_severities: dict[str, str] | None = None,
+) -> str:
+    egress_counts = egress_counts or Counter()
+    egress_actions = egress_actions or {}
+    egress_severities = egress_severities or {}
+    secret_counts = ", ".join(
+        f"{kind}={count}[{actions[kind]},{severities[kind]}]"
+        for kind, count in counts.items()
+    ) or "none"
+    egress_secret_counts = ", ".join(
+        f"{kind}={count}[{egress_actions[kind]},{egress_severities[kind]}]"
+        for kind, count in egress_counts.items()
+    ) or "none"
     return (
-        f"Secret types and counts: {secret_counts}. "
+        f"Ingress secret types and counts: {secret_counts}. "
+        f"Egress secret types and counts: {egress_secret_counts}. "
         f"Non-text parts withheld: {withheld_parts}."
     )
 
@@ -66,10 +90,14 @@ class NlipGatewaySession(NLIP_Session):
             text, withheld_parts = _extract_text_and_withheld(msg)
             vault = SecretVault()
             masked_text, counts = scan_and_sanitize(text, vault)
-            report = _security_report(counts, withheld_parts)
+            actions, severities = issue_policy_metadata(counts)
+            report = _security_report(counts, withheld_parts, actions, severities)
             logger.info(
-                "NLIP request processed: secret_types=%s non_text_parts_withheld=%d",
+                "NLIP request processed: secret_types=%s actions=%s severities=%s "
+                "non_text_parts_withheld=%d",
                 dict(counts),
+                actions,
+                severities,
                 withheld_parts,
             )
         except Exception as exc:
@@ -97,6 +125,28 @@ class NlipGatewaySession(NLIP_Session):
                 return _error_response("NLIP_GATEWAY_CHAT_ERROR", report)
         else:
             response_text = masked_text
+
+        try:
+            response_text, egress_counts = scan_and_sanitize(response_text)
+            egress_actions, egress_severities = issue_policy_metadata(egress_counts)
+            report = _security_report(
+                counts,
+                withheld_parts,
+                actions,
+                severities,
+                egress_counts,
+                egress_actions,
+                egress_severities,
+            )
+            logger.info(
+                "NLIP response scanned: egress_secret_types=%s actions=%s severities=%s",
+                dict(egress_counts),
+                egress_actions,
+                egress_severities,
+            )
+        except Exception as exc:
+            logger.error("NLIP response scanning failed (%s)", type(exc).__name__)
+            return _error_response("NLIP_GATEWAY_EGRESS_SCAN_ERROR")
 
         response = NLIP_Factory.create_text(response_text, language=TEXT_LANGUAGE)
         response.add_text(report, language=TEXT_LANGUAGE, label=SECURITY_REPORT_LABEL)

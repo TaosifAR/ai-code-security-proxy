@@ -8,7 +8,8 @@ import requests
 import streamlit as st
 
 from safe_workspace import build_safe_workspace, write_guard_files
-from security_proxy import safe_chat, scan_and_sanitize
+from security_proxy import issue_policy_metadata, safe_chat, scan_and_sanitize
+from secret_policy import PolicyConfigurationError
 
 st.set_page_config(page_title="AI Code Security Proxy", page_icon="🛡️", layout="wide")
 
@@ -54,14 +55,21 @@ with st.sidebar:
 
 
 def run_sanitizer(code: str):
-    """Return (safe_code, {type: count}) via API or in-process."""
+    """Return sanitized text, counts, actions, and severities."""
     if use_api:
         resp = requests.post(api_url, json={"code": code}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        return data["safe_code"], data["issue_counts"]
+        return (
+            data["safe_code"],
+            data["issue_counts"],
+            data["issue_actions"],
+            data["issue_severities"],
+        )
     safe, counts = scan_and_sanitize(code)
-    return safe, dict(counts)
+    count_dict = dict(counts)
+    actions, severities = issue_policy_metadata(counts)
+    return safe, count_dict, actions, severities
 
 
 # --------------------------------------------------------------------------
@@ -86,19 +94,41 @@ with tab_scan:
             st.info("Please enter some code first.")
         else:
             try:
-                safe_code, counts = run_sanitizer(code)
+                safe_code, counts, actions, severities = run_sanitizer(code)
+            except PolicyConfigurationError as exc:
+                st.error(f"Secret policy configuration error: {exc}")
+                st.stop()
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 422:
+                    st.error("The request was rejected by the secret handling policy.")
+                else:
+                    st.error(f"Scanner API returned HTTP {exc.response.status_code if exc.response else 'error'}.")
+                st.stop()
             except requests.RequestException as exc:
                 st.error(f"Could not reach the API: {exc}")
                 st.stop()
 
-            total = sum(counts.values())
-            if total:
-                st.warning(f"⚠️ {total} secret(s) detected and redacted "
-                           f"across {len(counts)} type(s). Safe to forward to the LLM.")
+            redactions = sum(
+                count for secret_type, count in counts.items()
+                if actions[secret_type] == "redact"
+            )
+            if redactions:
+                st.warning(f"⚠️ {redactions} secret(s) redacted "
+                           f"across {len(counts)} type(s).")
+            if any(action == "log" for action in actions.values()):
+                st.info("Some findings were logged by policy and left unchanged.")
+            if counts:
                 m1, m2 = st.columns(2)
-                m1.metric("Total redactions", total)
+                m1.metric("Total redactions", redactions)
                 m2.metric("Secret types", len(counts))
-                st.table({"Secret type": list(counts), "Count": list(counts.values())})
+                st.table(
+                    {
+                        "Secret type": list(counts),
+                        "Count": list(counts.values()),
+                        "Action": [actions[kind] for kind in counts],
+                        "Severity": [severities[kind] for kind in counts],
+                    }
+                )
             else:
                 st.success("✅ No secrets detected. Code is clean.")
 
@@ -133,6 +163,13 @@ with tab_chat:
                     result = resp.json()
                 else:
                     result = safe_chat(chat_prompt, chat_code, restore, api_key=api_key or None)
+        except PolicyConfigurationError as exc:
+            error = f"Secret policy configuration error: {exc}"
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 422:
+                error = "The request was rejected by the secret handling policy."
+            else:
+                error = f"Request failed (HTTP {exc.response.status_code if exc.response else 'error'})."
         except RuntimeError as exc:
             error = str(exc)
         except Exception as exc:  # network / upstream errors
@@ -143,8 +180,19 @@ with tab_chat:
         elif result:
             if result["total_redactions"]:
                 st.warning(f"⚠️ {result['total_redactions']} secret(s) masked before reaching Claude.")
+            elif result["detected_issues"]:
+                st.info("Findings were allowed or logged by policy and left unchanged.")
             else:
                 st.success("✅ No secrets found in the message.")
+            if result["detected_issues"]:
+                st.table(
+                    {
+                        "Secret type": result["detected_issues"],
+                        "Count": [result["issue_counts"][kind] for kind in result["detected_issues"]],
+                        "Action": [result["issue_actions"][kind] for kind in result["detected_issues"]],
+                        "Severity": [result["issue_severities"][kind] for kind in result["detected_issues"]],
+                    }
+                )
             a, b = st.columns(2)
             with a:
                 st.markdown("#### 🛡️ What Claude actually saw")
@@ -157,7 +205,8 @@ with tab_chat:
 # Tab 3: Safe workspace - sanitized project copy for AI agents
 # --------------------------------------------------------------------------
 with tab_ws:
-    st.caption("Builds a copy of your project without .env / key files and with secrets masked. "
+    st.caption("Builds a copy of your project without .env / key files and handles detected "
+               "secrets according to policy. "
                "Open the **copy** (not the original) in VS Code with AI agents.")
     ws_src = st.text_input("Project folder (original)", key="ws_src", placeholder=r"C:\Users\you\my-project")
     ws_dest = st.text_input("Safe copy folder (give THIS to AI tools)", key="ws_dest",
@@ -171,17 +220,22 @@ with tab_ws:
         except (ValueError, OSError) as exc:
             st.error(str(exc))
         else:
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Files copied", rep.copied)
             m2.metric("Files withheld", len(rep.blocked))
             m3.metric("Secrets redacted", rep.total_redactions)
+            m4.metric("Log-only findings", sum(sum(c.values()) for c in rep.logged.values()))
             if rep.blocked:
                 st.warning("Withheld (never copied): " + ", ".join(f"`{p}`" for p in rep.blocked))
             if rep.sanitized:
                 st.table({"File": list(rep.sanitized),
                           "Redactions": [", ".join(f"{k} x{v}" for k, v in c.items())
                                          for c in rep.sanitized.values()]})
-            if not rep.blocked and not rep.sanitized:
+            if rep.logged:
+                st.table({"File": list(rep.logged),
+                          "Log-only findings": [", ".join(f"{k} x{v}" for k, v in c.items())
+                                                for c in rep.logged.values()]})
+            if not rep.blocked and not rep.sanitized and not rep.logged:
                 st.success("✅ Nothing sensitive found.")
             if ws_dry:
                 st.info("Dry run: nothing was written. Untick it to create the safe copy.")

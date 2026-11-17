@@ -1,202 +1,316 @@
-# 🛡️ AI Code Security Proxy & Guardrail
+# BoundaryGuard: NLIP Egress Security Proxy
 
-A pluggable Python security middleware that sits between developers and AI coding assistants.
-It intercepts code, **detects secrets with regex, redacts them** as `[REDACTED_<TYPE>]`,
-logs a warning (never the secret itself), and only then lets the sanitized code through to the LLM / agent.
+**NDSS SafeOSE '27 Open-Source AI Security Hackathon**
 
-> Built for the **NDSS SafeOSE '27 Open-Source AI Security Hackathon**, Focus Area 03.
+**Area 03 — Security Functions at Unified Control Points**
 
-## The problem
+BoundaryGuard is a pluggable security proxy for AI-agent communication. It places
+secret detection and policy enforcement at the communication boundary, checking
+both text entering an agent and the agent's text response before it reaches the
+client. The control is outside the agent: integrating it does not require
+changing the agent's internal logic.
 
-Developers routinely paste code into LLM chats or hand files to AI agents for debugging.
-Along the way they leak API keys, database credentials, AWS tokens and private keys to a third party.
+The project implements a boundary control aligned with **ECMA-434 SCO 7.3.3
+(Information Leakage)** by inspecting agent-to-client responses and applying
+the configured secret-handling policy. This describes the implementation's
+security objective; it is not an independent standards conformance
+certification.
 
-## The solution
+## Why a unified control point?
 
+AI agents can read, transform, and repeat sensitive data. Prompt filtering alone
+cannot prevent information from being exposed in a response. A proxy at the
+communication boundary can apply one consistent policy to the traffic that is
+routed through it, regardless of the agent's framework or internal design.
+
+## Architecture and enforcement location
+
+BoundaryGuard is designed as a **Type-1 / Type-3 Security Element (SE)** at the
+NLIP communication boundary. The NLIP adapter is the enforcement point between
+the client and the agent or model; the agent itself does not need to be
+modified. The current demonstrator is implemented in Python using the NLIP
+server abstractions and the existing secret-scanning engine.
+
+```text
+NLIP client
+    │
+    │ NLIP request
+    ▼
+┌──────────────────────────────────────────┐
+│ BoundaryGuard / NLIP security gateway    │
+│                                          │
+│  Ingress: inspect, apply policy,         │
+│           withhold uninspectable parts   │
+│                                          │
+│  Egress: inspect agent response,         │
+│          apply policy before delivery    │
+└───────────────────┬──────────────────────┘
+                    │ sanitized request
+                    ▼
+            Agent / model service
+                    │ response
+                    └───────────────► egress scan ──► NLIP client
 ```
-Developer / IDE / Agent ──►  POST /sanitize  ──►  Sanitized code ──►  LLM / AI agent
-                           (Security Proxy)
-                      detect → redact → log warning
-```
 
-## Alignment with Focus Area 03: Security Functions at Unified Control Points
+In chat mode, egress inspection runs after locally restoring placeholders, so
+an agent echoing a request secret is checked just like a newly introduced
+secret. If response scanning fails, the gateway returns an error instead of
+forwarding the uninspected response. NLIP structured or other non-text request
+parts that the gateway cannot inspect are withheld.
 
-Instead of trusting every developer, tool and agent to handle secrets correctly, this project puts
-**one enforcement point** in front of all AI traffic:
+## Capabilities
 
-| Principle | How this project applies it |
+### Per-type policy engine
+
+Policies are loaded from JSON or YAML using `SECRET_POLICY_PATH`. Each detected
+secret type can have an action, severity, and allowlist:
+
+| Action | Behavior |
 |---|---|
-| **Single choke point** | Every request goes through `POST /sanitize`; no path to the LLM bypasses it. |
-| **Centralized policy** | All detection rules live in one list (`RULES` in `security_proxy.py`). Add a rule once, every client is protected. |
-| **Tool-agnostic** | Plain HTTP + JSON: works with chat UIs, IDE plugins, CI jobs and autonomous agents. |
-| **Safe auditing** | Logs secret *types and counts only*, never values. |
-| **Open source & pluggable** | Small, dependency-light, importable as a library (`sanitize_code`) or run as a service. |
+| `allow` | Pass unchanged and omit from findings. |
+| `log` | Pass unchanged; log type, severity, and count only. |
+| `redact` | Replace the detected value with a `[REDACTED_<TYPE>]` marker. |
+| `reject` | Return HTTP 422 from `POST /sanitize`; other scanning flows redact and report it. |
 
-## Detected secrets
+Without a policy file, detected types default to `redact` with `medium`
+severity. Allowlist entries support exact values and regular expressions
+matched against the complete value. Allowlisted values pass silently. Supported
+severities are `low`, `medium`, `high`, and `critical`.
 
-- OpenAI API keys (`sk-...`, `sk-proj-...`)
-- GitHub tokens (`ghp_...`, `gho_...`, `github_pat_...`)
-- AWS Access Key IDs (`AKIA...`) and Secret Access Keys
-- Database URLs: PostgreSQL, MongoDB, MySQL / MariaDB
-- PEM private keys
-- Slack tokens (`xoxb-...`), Stripe keys (`sk_live_...`), Google API keys (`AIza...`)
-- HTTP `Authorization: Bearer <token>` headers (only the token is masked)
-- Generic `api_key`, `password`, `secret`, `token` assignments (env lookups like `os.getenv(...)` are ignored)
+Example YAML policy:
 
-## Setup
-
-```bash
-# 1. Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
+```yaml
+default:
+  action: redact
+  severity: medium
+secret_types:
+  OPENAI_API_KEY:
+    action: reject
+    severity: critical
+    allowlist:
+      values: []
+      patterns:
+        - '^sk-test-.*'
 ```
 
-## Run
-
-**Streamlit demo UI** (runs the sanitizer in-process):
-
-```bash
-streamlit run app.py
-```
-
-**FastAPI security proxy:**
-
-```bash
-uvicorn security_proxy:app --reload --port 8000
-```
-
-Interactive docs: http://localhost:8000/docs. To make the UI call the API, enable *Use FastAPI endpoint* in the sidebar.
-
-**Example request:**
-
-```bash
-curl -X POST http://localhost:8000/sanitize \
-  -H "Content-Type: application/json" \
-  -d '{"code": "password = \"hunter2hunter2\""}'
-```
+The same schema is available in JSON:
 
 ```json
 {
-  "safe_code": "password = \"[REDACTED_GENERIC_SECRET]\"",
-  "detected_issues": ["GENERIC_SECRET"],
-  "issue_counts": {"GENERIC_SECRET": 1},
-  "total_redactions": 1,
-  "is_clean": false
+  "default": {"action": "redact", "severity": "medium"},
+  "secret_types": {
+    "OPENAI_API_KEY": {
+      "action": "reject",
+      "severity": "critical",
+      "allowlist": {"values": [], "patterns": ["^sk-test-.*"]}
+    }
+  }
 }
 ```
 
-**Use as a library:**
+Select a policy before starting the service:
 
-```python
-from security_proxy import sanitize_code
-
-safe_code, issues = sanitize_code(my_code)
+```powershell
+$env:SECRET_POLICY_PATH = ".\secret-policy.yaml"
 ```
 
-## Three ways to use it
+### Evasion-resistant scanning
 
-### 1. Scanner (`POST /sanitize`)
-Paste code, get masked code back. Placeholders look like `[REDACTED_OPENAI_API_KEY]`.
+In addition to the detector's provider-specific and generic patterns, scanning:
 
-### 2. Safe Chat / Proxy mode (`POST /chat`)
-The proxy masks secrets, sends **only the masked text** to Claude, and (optionally) puts the original values
-back into the answer *locally*, so the developer's code still works. Secrets never leave the machine.
+- Applies Unicode NFKC normalization and removes invisible format characters
+  while preserving source locations for redaction.
+- Attempts one layer of UTF-8 Base64 decoding and scans valid decoded text.
+- Checks sufficiently long, high-entropy tokens for otherwise unknown secrets.
+- Excludes UUIDs and plain hexadecimal hashes from entropy-only alerts.
+
+These are heuristic defenses, not a guarantee of detecting every secret format.
+Entropy-based checks can produce false positives.
+
+### Response scanning and safe reporting
+
+The NLIP gateway scans the final text response before constructing the message
+sent to the client. A labeled `security_report` submessage distinguishes
+ingress from egress findings and reports secret types, counts, actions, and
+severities—not secret values. Application logs likewise record metadata only.
+
+### Supported detector families
+
+- OpenAI API keys
+- GitHub tokens
+- AWS access key IDs and secret access keys
+- PostgreSQL, MongoDB, MySQL, and MariaDB connection strings
+- PEM private keys
+- Slack, Stripe, and Google API keys
+- Bearer tokens
+- Generic password, token, API-key, secret, and auth assignments
+- High-entropy tokens
+
+## Get started
+
+Python 3.10 or later is recommended. From the repository directory:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+On macOS or Linux, activate the environment with:
 
 ```bash
-# Windows PowerShell
-$env:ANTHROPIC_API_KEY = "your-key"
-uvicorn security_proxy:app --reload --port 8000
+source .venv/bin/activate
 ```
 
-```bash
-curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
-  -d '{"prompt": "Why does this fail?", "code": "password = \"hunter2hunter2\"", "restore": true}'
-```
+### Run the NLIP gateway
 
-The model defaults to `claude-sonnet-5-5`; override with the `CLAUDE_MODEL` environment variable.
-The response includes `sanitized_message`, i.e. exactly what the LLM saw, which is handy for auditing.
-
-### 3. Safe Workspace (protect the whole project folder)
-AI agents and editor extensions can read everything in an open workspace, including `.env`. Instead of
-trusting every tool's settings, build a sanitized copy and open **that** with AI tools:
-
-```bash
-python safe_workspace.py build  C:\path\to\my-project  C:\path\to\my-project-safe --dry-run   # preview
-python safe_workspace.py build  C:\path\to\my-project  C:\path\to\my-project-safe             # create
-python safe_workspace.py guard  C:\path\to\my-project      # add .cursorignore / .claude deny rules
-```
-
-- `.env`, `.env.*`, `*.pem`, `*.key`, credential files etc. are **never copied** (`.env.example` is kept)
-- every other text file is redacted; `.git`, `node_modules`, `.venv`, binaries and files over 2 MB are skipped
-- a `SAFE_WORKSPACE_REPORT.md` lists withheld files and secret *types* (never values)
-- `--dry-run` exits with code 1 if anything sensitive is found, so it also works as a CI / pre-commit check
-- `guard` writes best-effort ignore/deny files for the original project. Check each tool's docs for the exact
-  format it honours (for example GitHub Copilot content exclusion is configured in GitHub settings, not in a file).
-
-## NLIP Integration
-
-The NLIP gateway is a security control point inside NLIP agent communication. It receives an NLIP message,
-scans its text with the existing secret rules, and withholds non-text content it cannot inspect. It returns a
-labeled `security_report` submessage containing secret types and counts only.
-
-Install the requirements, then start the gateway from the project directory:
+Start the gateway on localhost:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn nlip_gateway:app --reload --host 127.0.0.1 --port 8001
 ```
 
-In another terminal, send the demo message containing runtime-assembled fake secrets:
-
-```powershell
-.\.venv\Scripts\python.exe nlip_demo_client.py
-```
-
-The gateway defaults to `NLIP_GATEWAY_MODE=sanitize`, which returns masked text without an API key. To use
-chat mode in PowerShell, set the mode and API key in the gateway terminal before starting it:
+The default `NLIP_GATEWAY_MODE=sanitize` mode scans and sanitizes NLIP text
+without calling a model. To enable the Claude-backed demo, configure the
+environment in the gateway terminal before starting it:
 
 ```powershell
 $env:NLIP_GATEWAY_MODE = "chat"
 $env:ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY"
 ```
 
-The gateway sends only masked text to Claude and restores placeholders in the reply locally.
+The gateway sends masked text to Claude and restores placeholders locally
+before its egress scan. The egress scan then applies the configured policy
+before any response is sent back to the NLIP client.
 
-Run the gateway tests with:
+In a second terminal, run the demo client:
+
+```powershell
+.\.venv\Scripts\python.exe nlip_demo_client.py
+```
+
+### Run the HTTP proxy or UI
+
+Run the standalone FastAPI sanitizer:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn security_proxy:app --reload --port 8000
+```
+
+Interactive API documentation is available at `http://localhost:8000/docs`.
+The Streamlit demonstration UI can be started with:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+## Evaluation and tests
+
+### Automated test suite
+
+The current suite has **16 passing pytest tests** covering detector
+obfuscation, policy parsing and actions, API behavior, NLIP ingress/egress
+handling, and evaluation-report metrics. Run the entire suite from the
+repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+To run only the NLIP gateway tests:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q test_nlip_gateway.py
 ```
 
-The `nlip-client` project is not available as an installable package from the configured Python package index.
-Its upstream Git source also refers to a sibling `../nlip_sdk` checkout, so it cannot be installed by itself.
-The demo therefore uses the installed NLIP SDK message model and HTTPX to post to the `/nlip/` route defined by
-`nlip-server`.
+### Detection evaluation harness
 
-## Project structure
+`eval.py` compares the project detector with a basic regex baseline. Supply
+three datasets: positive secret samples, benign negative samples, and evasion
+samples. Files can be newline-delimited text (`.txt`), a JSON array of strings
+(`.json`), or JSON Lines containing one string per line (`.jsonl`). Use JSON
+when a sample spans multiple lines.
 
+Example invocation:
+
+```powershell
+.\.venv\Scripts\python.exe eval.py `
+  --positive positive.json `
+  --negative negative.json `
+  --evasion evasion.json `
+  --iterations 100
 ```
-├── security_proxy.py   # detection rules, sanitize_code(), /sanitize, /chat (proxy mode)
-├── make_sample_project.py  # builds a demo project full of FAKE secrets
-├── safe_workspace.py   # sanitized project copy + guard files (CLI and library)
-├── app.py              # Streamlit demo UI (Scanner / Safe Chat / Safe Workspace tabs)
-├── nlip_gateway.py      # NLIP server that sanitizes messages or proxies masked text to Claude
-├── nlip_demo_client.py  # sends an NLIP message with fake secrets to the gateway
-├── test_nlip_gateway.py
-├── requirements.txt
-└── README.md
+
+The output is JSON and includes:
+
+| Metric | Meaning |
+|---|---|
+| Positive recall | Fraction of positive samples detected. |
+| Evasion recall | Fraction of evasion samples detected. |
+| Overall recall | Recall across positive and evasion samples, weighted by sample count. |
+| False-alarm rate | Fraction of negative samples detected. |
+| Latency p50 / p95 | Per-sample detector latency in milliseconds. |
+| Throughput | Combined samples processed per second. |
+
+Rates use a `0.0`–`1.0` scale. `--iterations` controls timing repetitions;
+detection metrics are calculated once per sample. The harness warms up on the
+samples before timing and reports detector runtime only—it does not measure
+network or model latency.
+
+Use synthetic credentials in evaluation datasets. No benchmark scores are
+published here because measured rates and timings depend on the supplied
+dataset, environment, and machine. The harness is intended to make comparisons
+repeatable against realistic positive, negative, and evasion corpora.
+
+## Other integrations
+
+- **Sanitize API:** `POST /sanitize` returns sanitized text and findings.
+- **Safe Chat API:** `POST /chat` sanitizes prompts and code before forwarding
+  masked text to Claude, with optional local placeholder restoration.
+- **Safe Workspace:** `safe_workspace.py build` creates a sanitized project
+  copy; credential files are withheld, text files are scanned, and a report
+  records secret types without values. The `guard` command can add best-effort
+  ignore/deny files.
+- **Library use:** `scan_and_sanitize()` returns sanitized text and per-type
+  counts; `sanitize_code()` offers a simpler convenience API.
+
+## Security boundaries and limitations
+
+- The proxy protects traffic only when clients and agents are routed through
+  it; it cannot protect bypass paths.
+- The NLIP gateway scans text. Uninspectable non-text request parts are
+  withheld rather than forwarded.
+- Base64 scanning is limited to one layer of valid UTF-8 text. Detection rules
+  and entropy thresholds may miss uncommon formats or flag benign values.
+- `allow` and `log` intentionally leave matching values unchanged. Review
+  allowlists and policy files carefully.
+- `eval.py` provides a local benchmark harness, not a security certification or
+  proof of complete detection.
+
+## Repository layout
+
+```text
+security_proxy.py                 Detection engine, policy enforcement, HTTP API
+secret_policy.py                  JSON/YAML policy loading and validation
+nlip_gateway.py                   NLIP boundary gateway with ingress/egress scans
+nlip_demo_client.py               Example NLIP client
+safe_workspace.py                 Sanitized project-copy and guard utilities
+app.py                            Streamlit demonstration UI
+eval.py                           Detector-versus-baseline evaluation CLI
+test_nlip_gateway.py              NLIP gateway tests
+test_secret_detection_obfuscation.py  Evasion-resistance tests
+test_secret_policy.py             Policy behavior tests
+test_eval.py                      Evaluation harness tests
+requirements.txt                  Runtime and test dependencies
 ```
 
-## Limitations & future work
+## Hackathon alignment
 
-- Regex detection can miss unusual formats and may flag some false positives; entropy-based detection would complement it.
-- Add per-organization custom rules and an allow-list.
-- A proxy only protects traffic that goes through it: tools must be pointed at it, or fed the safe workspace copy.
-- Add request audit logs and support for more LLM providers.
-- Support file/diff scanning and a pre-commit hook.
+Area 03 emphasizes security functions at unified control points. BoundaryGuard
+centralizes inspection and policy at the NLIP communication boundary, applies
+consistent ingress and egress handling without changing agent internals, and
+supports measurable evaluation of detection quality and runtime cost. Its
+egress scan is specifically intended to mitigate information leakage in
+agent-to-client responses, in alignment with ECMA-434 SCO 7.3.3.
 
-## Note on sample secrets
-
-All sample keys in the demo are fake and assembled at runtime so GitHub push protection does not block your commits.
+Project disclosures: [ETHICS.md](ETHICS.md) and [SECURITY.md](SECURITY.md).

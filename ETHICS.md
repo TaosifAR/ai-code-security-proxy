@@ -1,0 +1,114 @@
+# Ethical-by-Design Statement
+
+**Project:** BoundaryGuard / AI Code Security Proxy  
+**Scope:** NLIP security gateway, secret-scanning library, demo UI, and evaluation harness  
+**Last reviewed:** 2026-11
+
+BoundaryGuard is security middleware intended to reduce unintended disclosure
+of credentials and other secrets in AI-agent communications. It is designed to
+inspect text at a communication boundary rather than alter an agent's internal
+logic. It does not make decisions about people, determine eligibility, or
+replace human judgment. This statement documents the project's ethical intent
+and known limitations; it is not an independent ethical assessment or a claim
+of complete ECMA-434 conformance.
+
+## Profile 1 ethical principles
+
+### Respect for human autonomy
+
+Operators choose whether to route traffic through the proxy, whether to use the
+gateway's `sanitize` or `chat` mode, and which actions to configure for each
+secret type. The gateway defaults to `sanitize` mode. Operators can stop the
+service or return to sanitize-only operation without contacting an external
+model.
+
+Policy choices have consequences: `allow` and `log` intentionally pass values
+unchanged; allowlists suppress findings; and `reject` is enforced as HTTP 422
+only by `POST /sanitize`. Other flows redact and report reject-policy findings
+instead of rejecting the whole operation. Review the policy before enabling
+external-model traffic. Users should review generated content and retain
+control over whether and where it is used.
+
+### Prevention of harm
+
+The project aims to lower the risk of accidental credential disclosure by
+scanning ingress text and NLIP gateway responses. It applies the configured
+handling action to findings before forwarding; with the default `redact` action,
+detected values are masked. It withholds NLIP request parts that it cannot
+inspect and avoids putting detected secret values in security reports or
+application log messages.
+
+Detection is heuristic and incomplete. A missed secret may still be disclosed;
+benign data may be redacted; and `allow`, `log`, or allowlist configuration may
+permit sensitive values to pass. The scanner is not a substitute for secret
+rotation, access controls, secure storage, human review, or provider-specific
+data protections. The application does not execute submitted code, but it
+cannot guarantee that a downstream agent or client will handle returned text
+safely.
+
+### Fairness
+
+BoundaryGuard is not intended to score, classify, or make decisions about
+individuals or demographic groups. Its detection patterns can nevertheless
+behave differently across formats, languages, and character sets. Unicode
+normalization is used to improve matching, but the project has not completed a
+formal multilingual, demographic, or accessibility evaluation. False positives
+and missed detections should be reported and addressed without treating scanner
+output as a judgment about a person.
+
+### Explicability
+
+The project documents the detected secret type, count, configured action, and
+severity in reports; raw detected values are not included. The policy schema,
+default behavior, and major detection limitations are described in the
+repository's [README](README.md). Operators can inspect and change the JSON or
+YAML policy. Results are not a guarantee that content is safe or that every
+secret has been found.
+
+## Privacy and data handling
+
+The gateway keeps request text and its placeholder vault in process memory for
+the current request; this project does not implement a persistent request
+history or user-profile database. Its security reports and application
+redaction logs are intended to contain metadata, not secret values.
+
+In `chat` mode, sanitized text is sent to the configured Claude service. With
+the default redaction policy, detected values are masked before the request is
+sent. A policy action of `allow` or `log`, an allowlist, or an undetected
+format can leave sensitive data in the text sent externally. Provider-side
+processing and retention are governed by that provider and deployment's
+settings, not by this repository. Operators must review those terms and their
+own data-handling obligations before enabling chat mode.
+
+The service does not provide a data-export or deletion interface because it
+does not maintain an application request archive. Hosting platforms,
+reverse-proxy access logs, client-side state, and external providers may retain
+their own data; configure and clear those systems according to their policies.
+
+## User control, safety, and accountability
+
+- The operator controls service startup, gateway mode, policy file, and traffic
+  routing.
+- The default gateway mode is `sanitize`; chat mode requires explicit
+  configuration and an API key.
+- When response scanning fails, the NLIP gateway returns an error rather than
+  forwarding the uninspected response.
+- The gateway withholds non-text NLIP request parts it cannot inspect. The
+  current response scanner handles the text response generated by this
+  gateway; it is not a general inspection engine for arbitrary binary output.
+- Secret detection is not prompt-injection defense, malware detection, or a
+  general-purpose content-safety filter.
+- Ethical, privacy, fairness, and safety concerns can be raised through the
+  repository's [GitHub issue tracker](https://github.com/TaosifAR/ai-code-security-proxy/issues).
+  Do not include real credentials or sensitive personal information in public
+  issues; use the private security-reporting route described in
+  [SECURITY.md](SECURITY.md) for security vulnerabilities.
+
+## ECMA-434 reference
+
+This statement addresses the Profile 1 ethical-by-design disclosure topic in
+ECMA-434, *Security profiles for Natural Language Interaction Protocol*,
+clause 7.1.3 and the Profile 1 disclosure topic in informative Annex B. The
+standard's ethical principles inform this project statement; publishing it
+does not by itself establish conformance.
+

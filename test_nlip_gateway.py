@@ -93,5 +93,39 @@ def test_chat_sends_only_masked_text_and_restores_placeholders_locally(monkeypat
 
     assert len(sent_messages) == 1
     assert fake_openai_key not in sent_messages[0]
-    assert fake_openai_key in response.content
+    assert fake_openai_key not in response.to_json()
+    assert "[REDACTED_OPENAI_API_KEY]" in response.content
+    assert "Egress secret types and counts: OPENAI_API_KEY=1[redact,medium]" in report
     assert fake_openai_key not in report
+
+
+def test_chat_egress_scan_redacts_new_agent_secret(monkeypatch):
+    monkeypatch.setenv("NLIP_GATEWAY_MODE", "chat")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-test-key")
+    fake_github_token = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=f"Agent output includes {fake_github_token}",
+                    )
+                ]
+            )
+
+    class FakeAnthropic:
+        def __init__(self, api_key: str):
+            self.messages = FakeMessages()
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+    message = NLIP_Factory.create_text("Explain this harmless example.")
+
+    response = _run(NlipGatewaySession(), message)
+    report = _report_from(response)
+
+    assert fake_github_token not in response.to_json()
+    assert "[REDACTED_GITHUB_TOKEN]" in response.content
+    assert "Egress secret types and counts: GITHUB_TOKEN=1[redact,medium]" in report
+    assert fake_github_token not in report
