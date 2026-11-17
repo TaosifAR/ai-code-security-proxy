@@ -48,7 +48,7 @@ class Rule:
 
 
 # Values that look like secrets to the regex but are really code, not secrets.
-_FALSE_POSITIVE_VALUES = {"none", "null", "true", "false", "undefined", "string", "changeme"}
+_FALSE_POSITIVE_VALUES = {"none", "null", "true", "false", "undefined", "string", "changeme", "bearer", "basic"}
 
 
 def _is_real_generic_secret(value: str) -> bool:
@@ -76,13 +76,18 @@ RULES: list[Rule] = [
         "GITHUB_TOKEN",
         re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})"),
     ),
+    Rule("SLACK_TOKEN", re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}")),
+    Rule("STRIPE_KEY", re.compile(r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}")),
+    Rule("GOOGLE_API_KEY", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}")),
+    # HTTP "Authorization: Bearer <token>" headers (only the token is redacted)
+    Rule("BEARER_TOKEN", re.compile(r"(?i)\bbearer[ \t]+([A-Za-z0-9\-._~+/]{20,}=*)"), group=1),
     # AWS Access Key ID (AKIA... = long-term, ASIA... = temporary)
     Rule("AWS_ACCESS_KEY_ID", re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b")),
     # AWS Secret Access Key: 40 chars, detected by its variable name
     Rule(
         "AWS_SECRET_KEY",
         re.compile(
-            r"(?i)aws[_\-\s]?secret[_\-\s]?(?:access[_\-\s]?)?key[\"']?\s*[:=]\s*[\"']?"
+            r"(?i)aws[_\-\s]?secret[_\-\s]?(?:access[_\-\s]?)?key[\"']?[ \t]*[:=][ \t]*[\"']?"
             r"([A-Za-z0-9/+=]{40})"
         ),
         group=1,
@@ -100,7 +105,7 @@ RULES: list[Rule] = [
         "GENERIC_SECRET",
         re.compile(
             r"(?i)\b[\w.\-]*(?:api[_\-]?key|secret|passwd|password|pwd|token|auth)[\w.\-]*"
-            r"[\"']?\s*[:=]\s*[\"']?([^\"'\s,;]{4,})[\"']?"
+            r"[\"']?[ \t]*[:=][ \t]*[\"']?([^\"'\s,;]{4,})[\"']?"
         ),
         group=1,
         validator=_is_real_generic_secret,

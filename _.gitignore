@@ -14,3 +14,6 @@ __pycache__/
 *.pem
 *.key
 .streamlit/secrets.toml
+
+# demo output from make_sample_project.py
+sample-project*/

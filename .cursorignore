@@ -1,0 +1,10 @@
+# Written by AI Code Security Proxy
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+credentials.json
+secrets/
